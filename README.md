@@ -1,38 +1,38 @@
 # OHPE Reproduce: Occluded Human Pose Estimation with Part-aware Discrete Diffusion
 
-Reproduction of "Occluded human pose estimation based on part-aware discrete diffusion priors" (Knowledge-Based Systems, 2025).
+复现论文"基于部位感知离散扩散先验的遮挡人体姿态估计"（Knowledge-Based Systems, 2025）。
 
-## Project Structure
+## 项目结构
 
 ```
 ohpe_reproduce/
-├── configs/                    # YAML training configs
+├── configs/                    # YAML 训练配置
 │   ├── prior_vqvae.yaml
 │   └── diffusion.yaml
-├── models/                     # Core model implementations
-│   ├── mlp_mixer.py           # MLP-Mixer block
-│   ├── vector_quantize.py     # VQ layer with EMA
-│   ├── prior.py               # Hierarchical VQ-VAE prior
-│   ├── diffusion.py           # Discrete diffusion (D3PM + Obs token)
-│   ├── denoiser.py            # Transformer denoiser with AdaLN
-│   └── multimodal_encoder.py  # Swin + CLIP fusion
-├── utils/                      # Utilities
-│   ├── data_utils.py          # Dataset loader
-│   └── text_prompt.py         # Occlusion text generation
-├── tests/                      # TDD test suite (37 tests)
-├── train_prior.py             # Prior training script
-├── train_diffusion.py         # Diffusion training script
+├── models/                     # 核心模型实现
+│   ├── mlp_mixer.py           # MLP-Mixer 模块
+│   ├── vector_quantize.py     # 带 EMA 的 VQ 层
+│   ├── prior.py               # 层次化 VQ-VAE 先验
+│   ├── diffusion.py           # 离散扩散（D3PM + Obs token）
+│   ├── denoiser.py            # 带 AdaLN 的 Transformer 去噪器
+│   └── multimodal_encoder.py  # Swin + CLIP 融合
+├── utils/                      # 工具函数
+│   ├── data_utils.py          # 数据集加载器
+│   └── text_prompt.py         # 遮挡文本生成
+├── tests/                      # TDD 测试套件（37 个测试）
+├── train_prior.py             # 先验训练脚本
+├── train_diffusion.py         # 扩散训练脚本
 └── requirements.txt
 ```
 
-## Environment Setup
+## 环境配置
 
 ```bash
-conda env create -f environment.yml  # or use existing ohpe env
+conda env create -f environment.yml  # 或使用已有的 ohpe 环境
 conda activate ohpe
 ```
 
-Or manually:
+或手动配置：
 ```bash
 conda create -n ohpe python=3.10
 conda activate ohpe
@@ -40,53 +40,53 @@ pip install torch==2.1.0 torchvision==0.16.0 --index-url https://download.pytorc
 pip install -r requirements.txt
 ```
 
-## Running Tests
+## 运行测试
 
 ```bash
-# All tests
+# 运行所有测试
 pytest tests/ -v
 
-# Single module
+# 运行单个模块测试
 pytest tests/test_prior.py -v
 pytest tests/test_diffusion.py -v
 pytest tests/test_denoiser.py -v
 ```
 
-## Training
+## 训练
 
-### Stage 1: Hierarchical VQ-VAE Prior
+### 阶段一：层次化 VQ-VAE 先验
 
 ```bash
 python train_prior.py --config configs/prior_vqvae.yaml
 ```
 
-### Stage 2: Discrete Diffusion Model
+### 阶段二：离散扩散模型
 
 ```bash
-# Requires trained prior checkpoint
+# 需要先训练好先验的检查点
 python train_diffusion.py --config configs/diffusion.yaml
 ```
 
-## Key Implementation Details
+## 关键实现细节
 
-- **MLP-Mixer**: Token-mixing + channel-mixing MLPs, drop-in replacement for attention
-- **Vector Quantization**: EMA codebook update with straight-through estimator
-- **Hierarchical Prior**: 4 levels (head, arms, legs, global) with separate encoders/codebooks
-- **Discrete Diffusion**: Obscured-and-Replace transition matrix with Obs token
-- **Denoiser**: 19-layer Transformer with AdaLN, self-attention + cross-attention
-- **Multimodal Encoder**: Frozen Swin-Base + CLIP (image/text) with trainable projections
+- **MLP-Mixer**：Token 混合 + 通道混合 MLP，可替代注意力机制
+- **向量量化**：EMA 码本更新 + 直通估计器
+- **层次化先验**：4 个层级（头部、手臂、腿部、全局），各有独立的编码器/码本
+- **离散扩散**：遮挡替换转移矩阵 + Obs token
+- **去噪器**：19 层 Transformer + AdaLN，自注意力 + 交叉注意力
+- **多模态编码器**：冻结的 Swin-Base + CLIP（图像/文本）+ 可训练投影层
 
-## Test Coverage
+## 测试覆盖
 
-37 tests covering:
-- Input/output shapes for all modules
-- Gradient flow verification
-- EMA codebook update correctness
-- Diffusion transition matrix properties
-- End-to-end training step
-- Multimodal encoder backbone freezing
+37 个测试，覆盖：
+- 所有模块的输入/输出形状
+- 梯度流验证
+- EMA 码本更新正确性
+- 扩散转移矩阵性质
+- 端到端训练步骤
+- 多模态编码器骨干网络冻结
 
-## Citation
+## 引用
 
 ```bibtex
 @article{xiao2025occluded,
