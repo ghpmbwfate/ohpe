@@ -1,0 +1,27 @@
+# Discrete Diffusion Model Training Config
+num_timesteps: 100
+num_classes: 2048  # codebook size
+eta: 0.0005
+
+# Denoiser
+hidden_dim: 1024
+num_blocks: 19
+num_heads: 8
+cond_dim: 512
+mlp_ratio: 4.0
+dropout: 0.1
+
+# Training
+batch_size: 32
+lr: 0.0008
+weight_decay: 0.01
+epochs: 200
+num_workers: 4
+
+# Prior checkpoint
+prior_checkpoint: ./checkpoints/prior/best.pth
+
+# Logging
+save_dir: ./checkpoints/diffusion
+log_interval: 100
+save_interval: 10

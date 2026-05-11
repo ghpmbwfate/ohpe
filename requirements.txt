@@ -1,0 +1,13 @@
+torch==2.1.0
+torchvision==0.16.0
+timm==0.9.12
+open-clip-torch==2.24.0
+einops==0.7.0
+numpy==1.24.0
+scipy==1.11.0
+opencv-python==4.8.0
+pycocotools==2.0.7
+tqdm
+tensorboard
+wandb
+pytest==7.4.0
