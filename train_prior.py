@@ -14,7 +14,7 @@ os.environ.setdefault('TORCH_HOME', './models_pretrained')
 os.environ.setdefault('HF_HOME', './models_pretrained')
 
 from models.prior import HierarchicalPosePrior
-from utils.data_utils import PoseDataset, collate_fn
+from utils.data_utils import COCOPoseDataset, PoseDataset, collate_fn
 
 
 def train_epoch(model, dataloader, optimizer, device):
@@ -23,7 +23,7 @@ def train_epoch(model, dataloader, optimizer, device):
     total_recon = 0
     total_vq = 0
 
-    for batch in dataloader:
+    for batch in tqdm(dataloader, desc='Train', leave=False):
         _, poses, _, _ = batch
         poses = poses.to(device)
 
@@ -65,6 +65,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', default='configs/prior_vqvae.yaml')
     parser.add_argument('--device', default='cuda')
+    parser.add_argument('--data_dir', default='./data',
+                        help='COCO dataset root directory')
+    parser.add_argument('--use_coco', action='store_true', default=True,
+                        help='Use COCO dataset (default: True, use --no-use_coco for synthetic)')
     args = parser.parse_args()
 
     with open(args.config) as f:
@@ -74,8 +78,24 @@ def main():
     os.makedirs(cfg['save_dir'], exist_ok=True)
 
     # Dataset
-    train_ds = PoseDataset(num_samples=5000, num_keypoints=cfg['num_keypoints'])
-    val_ds = PoseDataset(num_samples=500, num_keypoints=cfg['num_keypoints'])
+    train_ann = os.path.join(args.data_dir, 'annotations', 'person_keypoints_train2017.json')
+    val_ann = os.path.join(args.data_dir, 'annotations', 'person_keypoints_val2017.json')
+    train_root = os.path.join(args.data_dir, 'train2017')
+    val_root = os.path.join(args.data_dir, 'val2017')
+
+    if args.use_coco and os.path.exists(train_ann) and os.path.exists(train_root):
+        print(f"Using COCO dataset from {args.data_dir}")
+        train_ds = COCOPoseDataset(train_root, train_ann, image_size=cfg['image_size'],
+                                    num_keypoints=cfg['num_keypoints'], split='train')
+        val_ds = COCOPoseDataset(val_root, val_ann, image_size=cfg['image_size'],
+                                  num_keypoints=cfg['num_keypoints'], split='val')
+    else:
+        print("COCO not found, falling back to synthetic data")
+        train_ds = PoseDataset(num_samples=5000, num_keypoints=cfg['num_keypoints'],
+                                image_size=cfg['image_size'])
+        val_ds = PoseDataset(num_samples=500, num_keypoints=cfg['num_keypoints'],
+                              image_size=cfg['image_size'])
+
     train_loader = DataLoader(train_ds, batch_size=cfg['batch_size'], shuffle=True,
                               num_workers=cfg['num_workers'], collate_fn=collate_fn)
     val_loader = DataLoader(val_ds, batch_size=cfg['batch_size'], shuffle=False,
