@@ -2,6 +2,7 @@
 Discrete Diffusion Model with Obscured-and-Replace state transition.
 Based on D3PM (Austin et al., NeurIPS 2021) with occlusion-aware modifications.
 """
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -39,31 +40,25 @@ class DiscreteDiffusion(nn.Module):
         mats = torch.zeros(T, S, S)
 
         for s in range(1, T + 1):
-            # Linear schedule as mentioned in paper
-            omega_s = 0.9 * (s / T)  # uniform diffusion rate
-            psi_s = 0.1 * (s / T)    # obs replacement rate
-            mu_s = 1.0 - omega_s * V - psi_s  # stay probability
-
-            # Clamp to avoid negative probabilities due to numerical issues
-            mu_s = max(mu_s, 0.0)
-            # Renormalize if necessary
-            total = mu_s + omega_s * V + psi_s
-            omega_s = omega_s / total
-            psi_s = psi_s / total
-            mu_s = mu_s / total
+            # Cosine schedule: alpha decays from 1 to 0, ensuring valid probabilities
+            # mu_s = alpha (stay prob), omega_s = per-state transition prob, psi_s = obs prob
+            alpha = 0.5 * (1 + math.cos(math.pi * s / T))
+            omega_s = (1 - alpha) * 0.9 / (V - 1)  # uniform to each other state
+            psi_s = (1 - alpha) * 0.1                # obs replacement
+            mu_s = alpha                              # stay probability
 
             # Build matrix
             A = torch.full((S, S), omega_s)
             # Diagonal entries for normal states
             for i in range(V):
                 A[i, i] = mu_s + omega_s
-            # Obs column: normal states -> obs with prob psi_s
-            A[:V, self.obs_index] = 0.0
-            # Obs row: obs stays obs with prob 1
-            A[self.obs_index, :] = psi_s
+            # Normal states -> Obs token with prob psi_s
+            A[:V, self.obs_index] = psi_s
+            # Obs is an absorbing state: once occluded, stays occluded
+            A[self.obs_index, :] = 0.0
             A[self.obs_index, self.obs_index] = 1.0
 
-            # Normalize rows
+            # Normalize rows to ensure valid probability distribution
             A = A / A.sum(dim=1, keepdim=True).clamp(min=1e-8)
             mats[s - 1] = A
 
@@ -171,7 +166,8 @@ class DiscreteDiffusion(nn.Module):
     @torch.no_grad()
     def p_sample(self, denoiser, x_t, t, condition):
         """
-        Single reverse sampling step: predict x_0, then compute x_{t-1}.
+        Single reverse sampling step: predict x_0, then sample from posterior
+        q(x_{t-1} | x_t, x_0_hat).
         """
         b, n = x_t.shape
         device = x_t.device
@@ -185,13 +181,38 @@ class DiscreteDiffusion(nn.Module):
             pred_probs.view(-1, self.num_classes), num_samples=1
         ).view(b, n)  # [B, N]
 
-        # Compute x_{t-1} distribution using q(x_{t-1} | x_t, x_0)
+        # Compute x_{t-1} from posterior q(x_{t-1} | x_t, x_0_hat)
         if t[0] > 0:
-            # Use posterior distribution
-            # Simplified: directly sample from predicted x_0 with some noise
-            # More accurate: compute full posterior using transition matrices
-            # For leapfrog/speed, we can just return predicted x_0
-            return pred_x_0
+            t_idx = t.clamp(max=self.num_timesteps - 1)
+            t_prev = t - 1
+
+            # Cumulative matrices
+            cum_mat_t = self.cum_transition_matrices[t_idx]      # Ā_t
+            cum_mat_t_prev = self.cum_transition_matrices[t_prev]  # Ā_{t-1}
+
+            # One-hot encodings
+            x_0_oh = F.one_hot(pred_x_0, self.num_states).float()  # [B, N, S]
+            x_t_oh = F.one_hot(x_t, self.num_states).float()       # [B, N, S]
+
+            # q(x_{t-1} | x_0) = x_0_oh @ Ā_{t-1}
+            q_t_prev_given_0 = torch.einsum('bns,bst->bnt', x_0_oh, cum_mat_t_prev)
+
+            # q(x_t | x_{t-1}) = A_{t-1}, row indexed by x_{t-1}
+            # q(x_t | x_{t-1}) as function of x_{t-1}: need column of A_{t-1} indexed by x_t
+            A_prev = self.transition_matrices[t_prev]  # [B, S, S]
+            # posterior ∝ q(x_t | x_{t-1}) * q(x_{t-1} | x_0)
+            # For each token: posterior[s'] ∝ A_{t-1}[s', x_t] * Ā_{t-1}[x_0, s']
+            # = A_{t-1}.T[x_t, s'] * q_t_prev_given_0[s']
+            q_xt_given_st_prev = torch.einsum('bns,bst->bnt', x_t_oh, A_prev.transpose(-2, -1))
+
+            posterior = q_xt_given_st_prev * q_t_prev_given_0
+            posterior = posterior.clamp(min=0)
+            posterior = posterior / posterior.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+
+            x = torch.multinomial(
+                posterior.view(-1, self.num_states), num_samples=1
+            ).view(b, n)
+            return x
         else:
             return pred_x_0
 

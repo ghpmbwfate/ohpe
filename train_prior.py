@@ -9,6 +9,10 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+# Set cache dirs for pretrained models before importing model classes
+os.environ.setdefault('TORCH_HOME', './models_pretrained')
+os.environ.setdefault('HF_HOME', './models_pretrained')
+
 from models.prior import HierarchicalPosePrior
 from utils.data_utils import PoseDataset, collate_fn
 

@@ -5,6 +5,8 @@ import torch
 from torch.utils.data import Dataset
 import numpy as np
 
+from utils.text_prompt import generate_text_prompt
+
 
 class PoseDataset(Dataset):
     """
@@ -28,7 +30,6 @@ class PoseDataset(Dataset):
         return self.num_samples
 
     def __getitem__(self, idx):
-        from utils.text_prompt import generate_text_prompt
         pose = self.poses[idx]
         vis = self.visibility[idx].numpy()
         text = generate_text_prompt(vis)

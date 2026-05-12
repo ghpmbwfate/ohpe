@@ -23,12 +23,10 @@ class MultimodalConditionEncoder(nn.Module):
         self.cache_dir = cache_dir
 
         # Swin-Base backbone (frozen)
-        # Set cache dir via env if provided
+        # Ensure cache directory exists
         if cache_dir:
             import os
             os.makedirs(cache_dir, exist_ok=True)
-            os.environ['TORCH_HOME'] = cache_dir
-            os.environ['HF_HOME'] = cache_dir
         self.swin = timm.create_model(
             swin_model,
             pretrained=True,
