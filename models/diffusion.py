@@ -91,11 +91,11 @@ class DiscreteDiffusion(nn.Module):
 
         # Get cumulative transition matrices for each batch element
         # cum_mats[t[i]]: [V+1, V+1]
-        cum_mat = self.cum_transition_matrices[t]  # [B, V+1, V+1]
+        cum_mat = self.cum_transition_matrices[t].to(device)  # [B, V+1, V+1]
 
         # For each token, get transition probabilities
         # x_0_one_hot: [B, N, V+1]
-        x_0_oh = F.one_hot(x_0, self.num_states).float()  # [B, N, V+1]
+        x_0_oh = F.one_hot(x_0, self.num_states).float().to(device)  # [B, N, V+1]
 
         # Compute q(x_t | x_0) for each token
         # [B, N, V+1] @ [B, V+1, V+1] -> [B, N, V+1]
@@ -109,62 +109,156 @@ class DiscreteDiffusion(nn.Module):
 
     def q_posterior_logits(self, x_t, x_0, t):
         """
-        Compute q(x_{t-1} | x_t, x_0) as logits for KL divergence.
-        Used during training to compute VLB.
+        Compute q(x_t | x_{t+1}, x_0) as logits for KL divergence.
+        Based on paper Eq.(14):
+            q(x_t | x_{t+1}, x_0) = [q(x_{t+1} | x_t) * q(x_t | x_0)] / q(x_{t+1} | x_0)
+
+        Args:
+            x_t: [B, N] noisy token indices at step t+1 (i.e., x_{t+1})
+            x_0: [B, N] clean token indices
+            t: [B] diffusion step indices (0..T-1), where x_t = x_{t+1}
+        Returns:
+            logits: [B, N, V+1] log probabilities of q(x_t | x_{t+1}, x_0)
         """
         b, n = x_t.shape
-        # Get transition matrices
+        device = x_t.device
+
+        # t is q_sample index (0..T-1), x_t corresponds to x_{t+1}
+        t = t.clamp(min=0, max=self.num_timesteps - 1)
+
+        # A_{t+1} = transition_matrices[t]
+        A_tp1 = self.transition_matrices[t].to(device)  # [B, S, S]
+
+        # \bar{A}_{t+1} = cum_transition_matrices[t]
+        cum_mat_tp1 = self.cum_transition_matrices[t].to(device)  # [B, S, S]
+
+        # \bar{A}_t = cum_transition_matrices[t-1] (I when t=0)
         if t.min() > 0:
-            cum_mat_t = self.cum_transition_matrices[t - 1]      # \bar{A}_{t-1}
+            cum_mat_t = self.cum_transition_matrices[t - 1].to(device)  # [B, S, S]
         else:
-            cum_mat_t = torch.eye(self.num_states, device=x_t.device).unsqueeze(0).expand(b, -1, -1)
+            eye = torch.eye(self.num_states, device=device).unsqueeze(0).expand(b, -1, -1)
+            # Only use eye for t=0 entries; for t>0 use cum_transition_matrices[t-1]
+            cum_mat_t = torch.zeros(b, self.num_states, self.num_states, device=device)
+            for i in range(b):
+                if t[i] > 0:
+                    cum_mat_t[i] = self.cum_transition_matrices[t[i] - 1].to(device)
+                else:
+                    cum_mat_t[i] = eye[0]
 
-        cum_mat_t_prev = self.cum_transition_matrices[t]         # \bar{A}_t
+        x_t_oh = F.one_hot(x_t, self.num_states).float().to(device)  # [B, N, S] (x_{t+1})
+        x_0_oh = F.one_hot(x_0, self.num_states).float().to(device)  # [B, N, S]
 
-        x_t_oh = F.one_hot(x_t, self.num_states).float()         # [B, N, V+1]
-        x_0_oh = F.one_hot(x_0, self.num_states).float()         # [B, N, V+1]
-
-        # Denominator: q(x_t | x_0) = x_0_oh @ \bar{A}_t
-        denom = torch.einsum('bns,bst->bnt', x_0_oh, cum_mat_t_prev)  # [B, N, V+1]
+        # Denominator: q(x_{t+1} | x_0) = x_0_oh @ \bar{A}_{t+1}
+        denom = torch.einsum('bns,bst->bnt', x_0_oh, cum_mat_tp1)  # [B, N, S]
         denom = denom.clamp(min=1e-8)
 
-        # Numerator: q(x_t | x_{t-1}) * q(x_{t-1} | x_0)
-        # Simplified: we compute this efficiently using matrix properties
-        # For training, we often use a simplified cross-entropy loss instead
-        return denom
+        # Numerator part 1: q(x_{t+1} | x_t) = A_{t+1}[x_t, x_{t+1}]
+        # For each possible x_t = s: A_{t+1}[s, x_{t+1}]
+        q_xtp1_given_xt = torch.einsum('bns,bst->bnt', x_t_oh, A_tp1.transpose(-2, -1))  # [B, N, S]
+
+        # Numerator part 2: q(x_t | x_0) = x_0_oh @ \bar{A}_t
+        q_xt_given_0 = torch.einsum('bns,bst->bnt', x_0_oh, cum_mat_t)  # [B, N, S]
+
+        # Full numerator and posterior
+        numer = q_xtp1_given_xt * q_xt_given_0  # [B, N, S]
+        posterior = numer / denom  # [B, N, S]
+        posterior = posterior.clamp(min=0)
+        posterior = posterior / posterior.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+
+        # Return as logits (log probabilities)
+        logits = torch.log(posterior.clamp(min=1e-8))
+        return logits
 
     def p_losses(self, denoiser, x_0, t, condition, target_pose, prior_model,
                  eta=0.0005):
         """
         Compute training losses for the diffusion model.
-        Returns total_loss, recon_loss
+        Implements the full loss from paper Eq.(20):
+            L_all = eta * L_k0 + L_vlb + L_tkn + L_Recon
+        Returns total_loss, recon_loss, l_k0, l_vlb, l_tkn
         """
         b = x_0.shape[0]
         device = x_0.device
 
-        # Forward diffusion: sample x_t
-        x_t = self.q_sample(x_0, t)  # [B, N]
+        # Forward diffusion: sample x_{t+1}
+        x_tp1 = self.q_sample(x_0, t)  # [B, N]
 
         # Predict x_0 distribution
-        pred_logits = denoiser(x_t, t, condition)  # [B, N, V]
+        pred_logits = denoiser(x_tp1, t, condition)  # [B, N, V]
+        pred_probs = F.softmax(pred_logits, dim=-1)  # [B, N, V]
 
-        # Auxiliary loss (simplified cross-entropy)
-        aux_loss = F.cross_entropy(
+        # L_k0: auxiliary loss (Eq.19) -log g_theta(k_0 | k_s, y)
+        l_k0 = F.cross_entropy(
             pred_logits.reshape(-1, self.num_classes),
             x_0.reshape(-1)
         )
 
-        # Token prediction loss
-        pred_probs = F.softmax(pred_logits, dim=-1)  # [B, N, V]
-        pred_indices = pred_probs.argmax(dim=-1)      # [B, N]
+        # L_tkn: token prediction cross-entropy (same as L_k0 in training)
+        l_tkn = l_k0.clone()
 
-        # Decode predicted pose for reconstruction loss
+        # L_Recon: pose reconstruction loss
+        pred_indices = pred_probs.argmax(dim=-1)  # [B, N]
         with torch.no_grad() if not target_pose.requires_grad else torch.enable_grad():
             pred_pose = prior_model.decode_from_indices(pred_indices)
-            recon_loss = F.smooth_l1_loss(pred_pose, target_pose)
+            l_recon = F.smooth_l1_loss(pred_pose, target_pose)
 
-        total_loss = eta * aux_loss + recon_loss
-        return total_loss, recon_loss, aux_loss
+        # L_vlb: variational lower bound (Eq.16)
+        # Compute true posterior q(x_t | x_{t+1}, x_0)
+        true_posterior_logits = self.q_posterior_logits(x_tp1, x_0, t)  # [B, N, S]
+        true_posterior = true_posterior_logits.exp()  # [B, N, S]
+
+        # Compute predicted posterior p_theta(x_t | x_{t+1}, y)
+        # p_theta(x_t | x_{t+1}, y) = sum_{x_0_bar} q(x_t | x_{t+1}, x_0_bar) * g_theta(x_0_bar | x_{t+1}, y)
+        # Build posterior for all possible x_0_bar (0..V-1)
+        x_0_all = torch.arange(self.num_classes, device=device)  # [V]
+        x_0_all_oh = F.one_hot(x_0_all, self.num_states).float().unsqueeze(0).expand(b, -1, -1)  # [B, V, S]
+
+        t_idx = t.clamp(min=0, max=self.num_timesteps - 1)
+        A_tp1 = self.transition_matrices[t_idx].to(device)  # [B, S, S]
+        cum_mat_tp1 = self.cum_transition_matrices[t_idx].to(device)  # [B, S, S]
+
+        if t.min() > 0:
+            cum_mat_t = self.cum_transition_matrices[t_idx - 1].to(device)  # [B, S, S]
+        else:
+            eye = torch.eye(self.num_states, device=device).unsqueeze(0).expand(b, -1, -1)
+            cum_mat_t = torch.zeros_like(eye)
+            for i in range(b):
+                if t[i] > 0:
+                    cum_mat_t[i] = self.cum_transition_matrices[t_idx[i] - 1].to(device)
+                else:
+                    cum_mat_t[i] = eye[i]
+
+        # Denominator for all x_0_bar: q(x_{t+1} | x_0_bar)
+        denom_all = torch.einsum('bvs,bst->bvt', x_0_all_oh, cum_mat_tp1)  # [B, V, S]
+        denom_all = denom_all.clamp(min=1e-8)
+
+        # q(x_{t+1} | x_t) for current x_{t+1}
+        x_tp1_oh = F.one_hot(x_tp1, self.num_states).float().to(device)  # [B, N, S]
+        q_xtp1_given_xt = torch.einsum('bns,bst->bnt', x_tp1_oh, A_tp1.transpose(-2, -1))  # [B, N, S]
+
+        # q(x_t | x_0_bar) for all x_0_bar
+        q_xt_given_0all = torch.einsum('bvs,bst->bvt', x_0_all_oh, cum_mat_t)  # [B, V, S]
+
+        # Posterior for all x_0_bar: [B, N, V, S]
+        numer_all = q_xtp1_given_xt.unsqueeze(2) * q_xt_given_0all.unsqueeze(1)  # [B, N, V, S]
+        posterior_all = numer_all / denom_all.unsqueeze(1)  # [B, N, V, S]
+        posterior_all = posterior_all.clamp(min=0)
+        posterior_all = posterior_all / posterior_all.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+
+        # Predicted posterior: sum over x_0_bar weighted by predicted probs
+        pred_posterior = torch.einsum('bnvs,bnv->bns', posterior_all, pred_probs)  # [B, N, S]
+        pred_posterior = pred_posterior.clamp(min=0)
+        pred_posterior = pred_posterior / pred_posterior.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+
+        # KL divergence: D_KL(true || pred)
+        kl = (true_posterior * (torch.log(true_posterior.clamp(min=1e-8)) -
+                                 torch.log(pred_posterior.clamp(min=1e-8)))).sum(dim=-1)  # [B, N]
+        l_vlb = kl.mean() * self.num_timesteps  # Scale by T for unbiased estimate
+
+        # Total loss (Eq.20)
+        total_loss = eta * l_k0 + l_vlb + l_tkn + l_recon
+
+        return total_loss, l_recon, l_k0, l_vlb, l_tkn
 
     @torch.no_grad()
     def p_sample(self, denoiser, x_t, t, condition):
@@ -184,31 +278,31 @@ class DiscreteDiffusion(nn.Module):
             pred_probs.view(-1, self.num_classes), num_samples=1
         ).view(b, n)  # [B, N]
 
-        # Compute x_{t-1} from posterior q(x_{t-1} | x_t, x_0_hat)
+        # Compute x_t from posterior q(x_t | x_{t+1}, x_0_hat)
+        # where x_{t+1} is current noisy state, x_t is previous (less noisy) state
         if t[0] > 0:
             t_idx = t.clamp(max=self.num_timesteps - 1)
             t_prev = t - 1
 
             # Cumulative matrices
-            cum_mat_t = self.cum_transition_matrices[t_idx]      # Ā_t
-            cum_mat_t_prev = self.cum_transition_matrices[t_prev]  # Ā_{t-1}
+            cum_mat_tp1 = self.cum_transition_matrices[t_idx].to(device)      # \bar{A}_{t+1}
+            cum_mat_t = self.cum_transition_matrices[t_prev].to(device)        # \bar{A}_t
 
             # One-hot encodings
-            x_0_oh = F.one_hot(pred_x_0, self.num_states).float()  # [B, N, S]
-            x_t_oh = F.one_hot(x_t, self.num_states).float()       # [B, N, S]
+            x_0_oh = F.one_hot(pred_x_0, self.num_states).float().to(device)  # [B, N, S]
+            x_tp1_oh = F.one_hot(x_t, self.num_states).float().to(device)      # [B, N, S] (x_{t+1})
 
-            # q(x_{t-1} | x_0) = x_0_oh @ Ā_{t-1}
-            q_t_prev_given_0 = torch.einsum('bns,bst->bnt', x_0_oh, cum_mat_t_prev)
+            # q(x_t | x_0) = x_0_oh @ \bar{A}_t
+            q_xt_given_0 = torch.einsum('bns,bst->bnt', x_0_oh, cum_mat_t)
 
-            # q(x_t | x_{t-1}) = A_{t-1}, row indexed by x_{t-1}
-            # q(x_t | x_{t-1}) as function of x_{t-1}: need column of A_{t-1} indexed by x_t
-            A_prev = self.transition_matrices[t_prev]  # [B, S, S]
-            # posterior ∝ q(x_t | x_{t-1}) * q(x_{t-1} | x_0)
-            # For each token: posterior[s'] ∝ A_{t-1}[s', x_t] * Ā_{t-1}[x_0, s']
-            # = A_{t-1}.T[x_t, s'] * q_t_prev_given_0[s']
-            q_xt_given_st_prev = torch.einsum('bns,bst->bnt', x_t_oh, A_prev.transpose(-2, -1))
+            # q(x_{t+1} | x_t) = A_{t+1} (transition from x_t to x_{t+1})
+            # Use t_idx to get A_{t+1} = transition_matrices[t]
+            A_tp1 = self.transition_matrices[t_idx].to(device)  # [B, S, S]
+            # For each possible x_t=s: A_{t+1}[s, x_{t+1}]
+            q_xtp1_given_xt = torch.einsum('bns,bst->bnt', x_tp1_oh, A_tp1.transpose(-2, -1))
 
-            posterior = q_xt_given_st_prev * q_t_prev_given_0
+            # Posterior: q(x_t | x_{t+1}, x_0_hat) ∝ q(x_{t+1} | x_t) * q(x_t | x_0)
+            posterior = q_xtp1_given_xt * q_xt_given_0
             posterior = posterior.clamp(min=0)
             posterior = posterior / posterior.sum(dim=-1, keepdim=True).clamp(min=1e-8)
 
@@ -229,10 +323,13 @@ class DiscreteDiffusion(nn.Module):
         device = condition.device
         n = prior_model.global_encoder.num_tokens if hasattr(prior_model.global_encoder, 'num_tokens') else 34
 
-        # Initialize from prior distribution
-        x = torch.full((b, n), self.obs_index, dtype=torch.long, device=device)
-        # Or sample from prior
-        # x = torch.multinomial(self.q_prior.unsqueeze(0).expand(b, -1), n, replacement=True)
+        # Initialize from prior distribution (paper Eq.17)
+        # q(k_T) = [bar{omega}_T, ..., bar{psi}_T]^T
+        x = torch.multinomial(
+            self.q_prior.unsqueeze(0).expand(b, -1),
+            n,
+            replacement=True,
+        ).view(b, n)  # [B, N]
 
         # Leapfrog sampling: jump from T to T-delta to T-2*delta ...
         timesteps = list(range(self.num_timesteps - 1, -1, -num_leapfrog))

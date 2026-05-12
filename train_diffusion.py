@@ -28,7 +28,9 @@ def train_epoch(prior, denoiser, diffusion, cond_encoder, dataloader,
 
     total_loss = 0
     total_recon = 0
-    total_aux = 0
+    total_k0 = 0
+    total_vlb = 0
+    total_tkn = 0
 
     for batch in tqdm(dataloader, desc='Train', leave=False):
         images, poses, visibilities, texts = batch
@@ -42,26 +44,11 @@ def train_epoch(prior, denoiser, diffusion, cond_encoder, dataloader,
         # Generate conditions using text prompts
         condition = cond_encoder(images, texts)
 
-        # Sample timesteps
+        # Sample timesteps and compute full paper losses
         t = torch.randint(0, diffusion.num_timesteps, (images.size(0),), device=device)
-
-        # Forward diffusion + denoise
-        x_t = diffusion.q_sample(x_0, t)
-        pred_logits = denoiser(x_t, t, condition)
-
-        # Losses
-        aux_loss = F.cross_entropy(
-            pred_logits.reshape(-1, pred_logits.size(-1)),
-            x_0.reshape(-1)
+        loss, recon_loss, l_k0, l_vlb, l_tkn = diffusion.p_losses(
+            denoiser, x_0, t, condition, poses, prior, eta
         )
-
-        # Reconstruction loss via predicted indices
-        pred_probs = F.softmax(pred_logits, dim=-1)
-        pred_indices = pred_probs.argmax(dim=-1)
-        pred_pose = prior.decode_from_indices(pred_indices)
-        recon_loss = F.smooth_l1_loss(pred_pose, poses)
-
-        loss = eta * aux_loss + recon_loss
 
         optimizer.zero_grad()
         loss.backward()
@@ -71,10 +58,13 @@ def train_epoch(prior, denoiser, diffusion, cond_encoder, dataloader,
 
         total_loss += loss.item()
         total_recon += recon_loss.item()
-        total_aux += aux_loss.item()
+        total_k0 += l_k0.item()
+        total_vlb += l_vlb.item()
+        total_tkn += l_tkn.item()
 
     n = len(dataloader)
-    return total_loss / n, total_recon / n, total_aux / n
+    return (total_loss / n, total_recon / n, total_k0 / n,
+            total_vlb / n, total_tkn / n)
 
 
 @torch.no_grad()
@@ -85,7 +75,9 @@ def validate(prior, denoiser, diffusion, cond_encoder, dataloader, device, eta):
 
     total_loss = 0
     total_recon = 0
-    total_aux = 0
+    total_k0 = 0
+    total_vlb = 0
+    total_tkn = 0
 
     for batch in tqdm(dataloader, desc='Val', leave=False):
         images, poses, visibilities, texts = batch
@@ -98,26 +90,19 @@ def validate(prior, denoiser, diffusion, cond_encoder, dataloader, device, eta):
         condition = cond_encoder(images, texts)
 
         t = torch.randint(0, diffusion.num_timesteps, (images.size(0),), device=device)
-        x_t = diffusion.q_sample(x_0, t)
-        pred_logits = denoiser(x_t, t, condition)
-
-        aux_loss = F.cross_entropy(
-            pred_logits.reshape(-1, pred_logits.size(-1)),
-            x_0.reshape(-1)
+        loss, recon_loss, l_k0, l_vlb, l_tkn = diffusion.p_losses(
+            denoiser, x_0, t, condition, poses, prior, eta
         )
 
-        pred_probs = F.softmax(pred_logits, dim=-1)
-        pred_indices = pred_probs.argmax(dim=-1)
-        pred_pose = prior.decode_from_indices(pred_indices)
-        recon_loss = F.smooth_l1_loss(pred_pose, poses)
-
-        loss = eta * aux_loss + recon_loss
         total_loss += loss.item()
         total_recon += recon_loss.item()
-        total_aux += aux_loss.item()
+        total_k0 += l_k0.item()
+        total_vlb += l_vlb.item()
+        total_tkn += l_tkn.item()
 
     n = len(dataloader)
-    return total_loss / n, total_recon / n, total_aux / n
+    return (total_loss / n, total_recon / n, total_k0 / n,
+            total_vlb / n, total_tkn / n)
 
 
 def main():
@@ -198,18 +183,22 @@ def main():
 
     best_val = float('inf')
     for epoch in range(cfg['epochs']):
-        train_loss, train_recon, train_aux = train_epoch(
+        (train_loss, train_recon, train_k0,
+         train_vlb, train_tkn) = train_epoch(
             prior, denoiser, diffusion, cond_encoder, train_loader,
             optimizer, device, cfg['eta']
         )
-        val_loss, val_recon, val_aux = validate(
+        (val_loss, val_recon, val_k0,
+         val_vlb, val_tkn) = validate(
             prior, denoiser, diffusion, cond_encoder, val_loader,
             device, cfg['eta']
         )
 
         print(f"Epoch {epoch+1}/{cfg['epochs']} | "
-              f"train_loss={train_loss:.4f} (recon={train_recon:.4f}, aux={train_aux:.4f}) | "
-              f"val_loss={val_loss:.4f} (recon={val_recon:.4f}, aux={val_aux:.4f})")
+              f"train_loss={train_loss:.4f} (recon={train_recon:.4f}, k0={train_k0:.4f}, "
+              f"vlb={train_vlb:.4f}, tkn={train_tkn:.4f}) | "
+              f"val_loss={val_loss:.4f} (recon={val_recon:.4f}, k0={val_k0:.4f}, "
+              f"vlb={val_vlb:.4f}, tkn={val_tkn:.4f})")
 
         if val_loss < best_val:
             best_val = val_loss
