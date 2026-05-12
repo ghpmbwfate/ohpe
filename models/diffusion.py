@@ -26,6 +26,9 @@ class DiscreteDiffusion(nn.Module):
         self.register_buffer('cum_transition_matrices', cum_mats)
         self.register_buffer('q_prior', prior)
 
+        # Move to target device so buffers match input tensors
+        self.to(device)
+
     def _compute_transition_matrices(self):
         """
         Compute A_s for s=1..T and cumulative \bar{A}_s.
