@@ -42,7 +42,7 @@ def test_prior_training(num_samples=100, num_epochs=3, device='cpu'):
     print(f"TEST: Prior Training (samples={num_samples}, epochs={num_epochs}, device={device})")
     print("=" * 60)
 
-    dataset = PoseDataset(num_samples=num_samples, num_keypoints=17, image_size=256)
+    dataset = PoseDataset(num_samples=num_samples, num_keypoints=17, image_size=224)
     loader = DataLoader(dataset, batch_size=8, shuffle=True, collate_fn=collate_fn)
 
     model = HierarchicalPosePrior(
@@ -92,7 +92,7 @@ def test_diffusion_training(num_samples=50, num_epochs=3, device='cpu'):
     print(f"TEST: Diffusion Training (samples={num_samples}, epochs={num_epochs}, device={device})")
     print("=" * 60)
 
-    dataset = PoseDataset(num_samples=num_samples, num_keypoints=17, image_size=256)
+    dataset = PoseDataset(num_samples=num_samples, num_keypoints=17, image_size=224)
     loader = DataLoader(dataset, batch_size=4, shuffle=True, collate_fn=collate_fn)
 
     # Small prior for speed

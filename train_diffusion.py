@@ -55,10 +55,11 @@ def train_epoch(prior, denoiser, diffusion, cond_encoder, dataloader,
             x_0.reshape(-1)
         )
 
-        # Reconstruction loss via predicted indices
+        # Reconstruction loss via hard decoding (stable, no gradient explosion)
         pred_probs = F.softmax(pred_logits, dim=-1)
         pred_indices = pred_probs.argmax(dim=-1)
-        pred_pose = prior.decode_from_indices(pred_indices)
+        with torch.no_grad():
+            pred_pose = prior.decode_from_indices(pred_indices)
         recon_loss = F.smooth_l1_loss(pred_pose, poses)
 
         loss = eta * aux_loss + recon_loss
@@ -72,6 +73,11 @@ def train_epoch(prior, denoiser, diffusion, cond_encoder, dataloader,
         total_loss += loss.item()
         total_recon += recon_loss.item()
         total_aux += aux_loss.item()
+
+        # NaN detection
+        if torch.isnan(loss):
+            print(f"NaN detected! aux_loss={aux_loss.item():.4f}, recon_loss={recon_loss.item():.4f}")
+            break
 
     n = len(dataloader)
     return total_loss / n, total_recon / n, total_aux / n
@@ -144,14 +150,14 @@ def main():
 
     if args.use_coco and os.path.exists(train_ann) and os.path.exists(train_root):
         print(f"Using COCO dataset from {args.data_dir}")
-        train_ds = COCOPoseDataset(train_root, train_ann, image_size=cfg.get('image_size', 256),
+        train_ds = COCOPoseDataset(train_root, train_ann, image_size=cfg.get('image_size', 224),
                                     split='train')
-        val_ds = COCOPoseDataset(val_root, val_ann, image_size=cfg.get('image_size', 256),
+        val_ds = COCOPoseDataset(val_root, val_ann, image_size=cfg.get('image_size', 224),
                                   split='val')
     else:
         print("COCO not found, falling back to synthetic data")
-        train_ds = PoseDataset(num_samples=5000, image_size=cfg.get('image_size', 256))
-        val_ds = PoseDataset(num_samples=500, image_size=cfg.get('image_size', 256))
+        train_ds = PoseDataset(num_samples=5000, image_size=cfg.get('image_size', 224))
+        val_ds = PoseDataset(num_samples=500, image_size=cfg.get('image_size', 224))
 
     train_loader = DataLoader(train_ds, batch_size=cfg['batch_size'], shuffle=True,
                               num_workers=cfg['num_workers'], collate_fn=collate_fn)
@@ -161,7 +167,7 @@ def main():
     # Load frozen prior
     prior = HierarchicalPosePrior(
         codebook_size=cfg['num_classes'],
-        embed_dim=cfg['hidden_dim'],
+        embed_dim=512,  # Must match prior training config, NOT cfg['hidden_dim']
     ).to(device)
     prior.load_state_dict(torch.load(cfg['prior_checkpoint'], map_location=device))
     prior.eval()

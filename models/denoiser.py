@@ -32,6 +32,8 @@ class AdaLN(nn.Module):
         self.norm = nn.LayerNorm(hidden_dim, elementwise_affine=False)
         # Project condition to scale + shift
         self.scale_shift = nn.Linear(cond_dim, hidden_dim * 2)
+        nn.init.zeros_(self.scale_shift.weight)
+        nn.init.zeros_(self.scale_shift.bias)
 
     def forward(self, x, t_emb):
         # x: [B, N, hidden_dim]

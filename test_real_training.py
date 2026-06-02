@@ -43,9 +43,9 @@ def test_prior_on_real_data(root_dir, ann_file, num_epochs=2, max_batches=50, de
 
     if not os.path.exists(root_dir) or not os.path.exists(ann_file):
         print(f"[SKIP] Dataset not found, falling back to synthetic data")
-        dataset = PoseDataset(num_samples=500, num_keypoints=17, image_size=256)
+        dataset = PoseDataset(num_samples=500, num_keypoints=17, image_size=224)
     else:
-        dataset = COCOPoseDataset(root_dir, ann_file, image_size=256, split='train')
+        dataset = COCOPoseDataset(root_dir, ann_file, image_size=224, split='train')
 
     loader = DataLoader(dataset, batch_size=8, shuffle=True,
                         num_workers=2, collate_fn=collate_fn)
@@ -96,9 +96,9 @@ def test_diffusion_on_real_data(root_dir, ann_file, num_epochs=2, max_batches=30
 
     if not os.path.exists(root_dir) or not os.path.exists(ann_file):
         print(f"[SKIP] Dataset not found, falling back to synthetic data")
-        dataset = PoseDataset(num_samples=200, num_keypoints=17, image_size=256)
+        dataset = PoseDataset(num_samples=200, num_keypoints=17, image_size=224)
     else:
-        dataset = COCOPoseDataset(root_dir, ann_file, image_size=256, split='train')
+        dataset = COCOPoseDataset(root_dir, ann_file, image_size=224, split='train')
 
     loader = DataLoader(dataset, batch_size=4, shuffle=True,
                         num_workers=2, collate_fn=collate_fn)
