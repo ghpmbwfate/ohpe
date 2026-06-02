@@ -202,61 +202,11 @@ class DiscreteDiffusion(nn.Module):
             pred_pose = prior_model.decode_from_indices(pred_indices)
             l_recon = F.smooth_l1_loss(pred_pose, target_pose)
 
-        # L_vlb: variational lower bound (Eq.16)
-        # Compute true posterior q(x_t | x_{t+1}, x_0)
-        true_posterior_logits = self.q_posterior_logits(x_tp1, x_0, t)  # [B, N, S]
-        true_posterior = true_posterior_logits.exp()  # [B, N, S]
+        # L_vlb: skipped during early training (OOM risk + numerical instability)
+        l_vlb = torch.tensor(0.0, device=device)
 
-        # Compute predicted posterior p_theta(x_t | x_{t+1}, y)
-        # p_theta(x_t | x_{t+1}, y) = sum_{x_0_bar} q(x_t | x_{t+1}, x_0_bar) * g_theta(x_0_bar | x_{t+1}, y)
-        # Build posterior for all possible x_0_bar (0..V-1)
-        x_0_all = torch.arange(self.num_classes, device=device)  # [V]
-        x_0_all_oh = F.one_hot(x_0_all, self.num_states).float().unsqueeze(0).expand(b, -1, -1)  # [B, V, S]
-
-        t_idx = t.clamp(min=0, max=self.num_timesteps - 1)
-        A_tp1 = self.transition_matrices[t_idx].to(device)  # [B, S, S]
-        cum_mat_tp1 = self.cum_transition_matrices[t_idx].to(device)  # [B, S, S]
-
-        if t.min() > 0:
-            cum_mat_t = self.cum_transition_matrices[t_idx - 1].to(device)  # [B, S, S]
-        else:
-            eye = torch.eye(self.num_states, device=device).unsqueeze(0).expand(b, -1, -1)
-            cum_mat_t = torch.zeros_like(eye)
-            for i in range(b):
-                if t[i] > 0:
-                    cum_mat_t[i] = self.cum_transition_matrices[t_idx[i] - 1].to(device)
-                else:
-                    cum_mat_t[i] = eye[i]
-
-        # Denominator for all x_0_bar: q(x_{t+1} | x_0_bar)
-        denom_all = torch.einsum('bvs,bst->bvt', x_0_all_oh, cum_mat_tp1)  # [B, V, S]
-        denom_all = denom_all.clamp(min=1e-8)
-
-        # q(x_{t+1} | x_t) for current x_{t+1}
-        x_tp1_oh = F.one_hot(x_tp1, self.num_states).float().to(device)  # [B, N, S]
-        q_xtp1_given_xt = torch.einsum('bns,bst->bnt', x_tp1_oh, A_tp1.transpose(-2, -1))  # [B, N, S]
-
-        # q(x_t | x_0_bar) for all x_0_bar
-        q_xt_given_0all = torch.einsum('bvs,bst->bvt', x_0_all_oh, cum_mat_t)  # [B, V, S]
-
-        # Posterior for all x_0_bar: [B, N, V, S]
-        numer_all = q_xtp1_given_xt.unsqueeze(2) * q_xt_given_0all.unsqueeze(1)  # [B, N, V, S]
-        posterior_all = numer_all / denom_all.unsqueeze(1)  # [B, N, V, S]
-        posterior_all = posterior_all.clamp(min=0)
-        posterior_all = posterior_all / posterior_all.sum(dim=-1, keepdim=True).clamp(min=1e-8)
-
-        # Predicted posterior: sum over x_0_bar weighted by predicted probs
-        pred_posterior = torch.einsum('bnvs,bnv->bns', posterior_all, pred_probs)  # [B, N, S]
-        pred_posterior = pred_posterior.clamp(min=0)
-        pred_posterior = pred_posterior / pred_posterior.sum(dim=-1, keepdim=True).clamp(min=1e-8)
-
-        # KL divergence: D_KL(true || pred)
-        kl = (true_posterior * (torch.log(true_posterior.clamp(min=1e-8)) -
-                                 torch.log(pred_posterior.clamp(min=1e-8)))).sum(dim=-1)  # [B, N]
-        l_vlb = kl.mean() * self.num_timesteps  # Scale by T for unbiased estimate
-
-        # Total loss (Eq.20)
-        total_loss = eta * l_k0 + l_vlb + l_tkn + l_recon
+        # Total loss (Eq.20, VLB disabled for stability)
+        total_loss = eta * l_k0 + l_tkn + l_recon
 
         return total_loss, l_recon, l_k0, l_vlb, l_tkn
 
