@@ -50,18 +50,6 @@ def train_epoch(prior, denoiser, diffusion, cond_encoder, dataloader,
             denoiser, x_0, t, condition, poses, prior, eta
         )
 
-<<<<<<< HEAD
-        # Reconstruction loss via hard decoding (stable, no gradient explosion)
-        pred_probs = F.softmax(pred_logits, dim=-1)
-        pred_indices = pred_probs.argmax(dim=-1)
-        with torch.no_grad():
-            pred_pose = prior.decode_from_indices(pred_indices)
-        recon_loss = F.smooth_l1_loss(pred_pose, poses)
-
-        loss = eta * aux_loss + recon_loss
-
-=======
->>>>>>> 17b401ce15c74c24cc904d1c96649063388352bd
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(denoiser.parameters(), 1.0)
@@ -76,7 +64,7 @@ def train_epoch(prior, denoiser, diffusion, cond_encoder, dataloader,
 
         # NaN detection
         if torch.isnan(loss):
-            print(f"NaN detected! aux_loss={aux_loss.item():.4f}, recon_loss={recon_loss.item():.4f}")
+            print(f"NaN detected! loss={loss.item():.4f}, recon={recon_loss.item():.4f}")
             break
 
     n = len(dataloader)
