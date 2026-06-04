@@ -83,10 +83,10 @@ def load_models(config_path, prior_ckpt, diffusion_ckpt, device):
     with open(config_path) as f:
         cfg = yaml.safe_load(f)
 
-    # 先验模型（冻结）
+    # 先验模型（冻结）— embed_dim=512 matches prior training, NOT cfg['hidden_dim']=1024
     prior = HierarchicalPosePrior(
         codebook_size=cfg['num_classes'],
-        embed_dim=cfg['hidden_dim'],
+        embed_dim=512,
     ).to(device)
     prior.load_state_dict(torch.load(prior_ckpt, map_location=device))
     prior.eval()

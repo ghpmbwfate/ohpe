@@ -150,7 +150,7 @@ class DiscreteDiffusion(nn.Module):
 
         # Denominator: q(x_{t+1} | x_0) = x_0_oh @ \bar{A}_{t+1}
         denom = torch.einsum('bns,bst->bnt', x_0_oh, cum_mat_tp1)  # [B, N, S]
-        denom = denom.clamp(min=1e-8)
+        denom = denom.clamp(min=1e-6)
 
         # Numerator part 1: q(x_{t+1} | x_t) = A_{t+1}[x_t, x_{t+1}]
         # For each possible x_t = s: A_{t+1}[s, x_{t+1}]
@@ -163,11 +163,115 @@ class DiscreteDiffusion(nn.Module):
         numer = q_xtp1_given_xt * q_xt_given_0  # [B, N, S]
         posterior = numer / denom  # [B, N, S]
         posterior = posterior.clamp(min=0)
-        posterior = posterior / posterior.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+        posterior = posterior / posterior.sum(dim=-1, keepdim=True).clamp(min=1e-6)
 
-        # Return as logits (log probabilities)
-        logits = torch.log(posterior.clamp(min=1e-8))
+        # Return as logits (log probabilities). Floor at 1e-6 (was 1e-8) for stability.
+        logits = torch.log(posterior.clamp(min=1e-6))
         return logits
+
+    def _compute_vlb_chunked(self, x_0, x_tp1, t, pred_probs, chunk_size=512):
+        """
+        Compute KL[ q(k_{s-1}|k_s, x_0_true) || g_θ(k_{s-1}|k_s, y) ] in chunks over
+        the codebook dimension V, avoiding the [B, N, V, S] OOM blowup.
+
+        The reparameterized model posterior is:
+            g_θ(k_{s-1}|k_s,y) = Σ_{k̄_0} q(k_{s-1}|k_s, k̄_0) · pred_probs[..., k̄_0]
+
+        Args:
+            x_0:        [B, N]   clean token indices (values in 0..V-1)
+            x_tp1:      [B, N]   noisy token indices at step t+1 (values in 0..V)
+            t:          [B]      timestep indices
+            pred_probs: [B, N, V] softmax of denoiser logits over V classes
+        Returns:
+            scalar KL averaged over batch & tokens.
+        """
+        B, N = x_0.shape
+        V = self.num_classes
+        S = self.num_states
+        device = x_0.device
+
+        # Build target posterior q(k_{s-1}|k_s, x_0_true) once -> [B, N, S]
+        target_log_post = self.q_posterior_logits(x_tp1, x_0, t)
+        target_post = target_log_post.exp()
+
+        # Accumulate model posterior g_θ(k_{s-1}|k_s, y) -> [B, N, S]
+        # by summing q(k_{s-1}|k_s, k̄_0) * pred_probs[..., k̄_0] over k̄_0 in chunks.
+        model_post = torch.zeros(B, N, S, device=device)
+
+        # Precompute matrices needed for q(k_{s-1}|k_s, k̄_0) per-batch.
+        # q(k_{s-1}|k_s, k̄_0) ∝ q(k_s|k_{s-1}) * q(k_{s-1}|k̄_0)
+        # In our indexing: t corresponds to step s; A_{t+1}=transition_matrices[t];
+        # \bar{A}_t = cum_transition_matrices[t-1] or I if t==0.
+        t_clamped = t.clamp(min=0, max=self.num_timesteps - 1)
+        A_tp1 = self.transition_matrices[t_clamped].to(device)          # [B, S, S]
+        cum_mat_tp1 = self.cum_transition_matrices[t_clamped].to(device)  # [B, S, S]
+
+        if t.min() > 0:
+            cum_mat_t = self.cum_transition_matrices[t - 1].to(device)
+        else:
+            cum_mat_t = torch.zeros(B, S, S, device=device)
+            eye_S = torch.eye(S, device=device)
+            for i in range(B):
+                if t[i] > 0:
+                    cum_mat_t[i] = self.cum_transition_matrices[t[i] - 1].to(device)
+                else:
+                    cum_mat_t[i] = eye_S
+
+        # x_tp1 one-hot for indexing into A_{t+1}: we need q(k_{s}|k_{s-1})=A_{t+1}[k_{s-1}, k_s]
+        # For each candidate previous state s' in [0..S-1] and each batch element,
+        # q(k_s=x_tp1 | k_{s-1}=s') = A_{t+1}[b, s', x_tp1[b,n]] -> shape [B, N, S]
+        x_tp1_oh = F.one_hot(x_tp1, S).float()                         # [B, N, S]
+        # q_xtp1_given_prev[b,n,s'] = A_{t+1}[b, s', x_tp1[b,n]]
+        q_xtp1_given_prev = torch.einsum('bns,bts->bnt', x_tp1_oh, A_tp1)  # [B, N, S]
+
+        # For the denominator q(k_s=x_tp1 | k̄_0): we'll compute per-chunk.
+        # q(k_s | k̄_0) = cum_mat_tp1[b, k̄_0, k_s], shape [B, V] for fixed k_s per (b,n)
+        # We extract these slices per-chunk.
+
+        for v_start in range(0, V, chunk_size):
+            v_end = min(v_start + chunk_size, V)
+            cs = v_end - v_start
+
+            # q(k_{s-1}=s' | k̄_0) for k̄_0 in chunk = cum_mat_t[b, k̄_0, s']
+            # Shape: [B, cs, S]
+            q_prev_given_k0_chunk = cum_mat_t[:, v_start:v_end, :]  # [B, cs, S]
+
+            # q(k_s = x_tp1 | k̄_0) = cum_mat_tp1[b, k̄_0, x_tp1[b,n]]
+            # Shape: [B, N, cs]
+            q_xtp1_given_k0_chunk = torch.einsum(
+                'bns,bvs->bnv', x_tp1_oh, cum_mat_tp1[:, v_start:v_end, :]
+            )  # [B, N, cs]
+            q_xtp1_given_k0_chunk = q_xtp1_given_k0_chunk.clamp(min=1e-6)
+
+            # Per-k̄_0 posterior over previous state:
+            # q(k_{s-1}|k_s,k̄_0) ∝ q(k_s|k_{s-1}) * q(k_{s-1}|k̄_0) / q(k_s|k̄_0)
+            # numerator: q_xtp1_given_prev [B,N,S] * q_prev_given_k0_chunk [B,cs,S]
+            #            -> [B, N, cs, S]
+            numer = q_xtp1_given_prev.unsqueeze(2) * q_prev_given_k0_chunk.unsqueeze(1)
+            # denom: q_xtp1_given_k0_chunk [B, N, cs, 1]
+            post_chunk = numer / q_xtp1_given_k0_chunk.unsqueeze(-1)
+            post_chunk = post_chunk.clamp(min=0)
+            post_chunk = post_chunk / post_chunk.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+            # post_chunk: [B, N, cs, S]
+
+            # Weight by pred_probs[..., k̄_0] for k̄_0 in chunk and accumulate
+            w = pred_probs[:, :, v_start:v_end]  # [B, N, cs]
+            model_post = model_post + (post_chunk * w.unsqueeze(-1)).sum(dim=2)
+
+        # Renormalize model_post (should already sum near 1 since pred_probs sums to 1
+        # and each post_chunk sums to 1, but float roundoff).
+        model_post = model_post / model_post.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+
+        # KL( target || model ) = Σ target * (log target - log model)
+        # Use larger floor (1e-6) than typical (1e-8) to avoid log(1e-8)=-18.4 producing
+        # explosive gradients on rare classes.
+        log_model_post = torch.log(model_post.clamp(min=1e-6))
+        kl = (target_post * (target_log_post - log_model_post)).sum(dim=-1)  # [B, N]
+
+        # Safety net: if any element is non-finite (overflow/underflow somewhere),
+        # mask it out rather than poisoning the backward pass with inf/nan.
+        kl = torch.where(torch.isfinite(kl), kl, torch.zeros_like(kl))
+        return kl.mean()
 
     def p_losses(self, denoiser, x_0, t, condition, target_pose, prior_model,
                  eta=0.0005):
@@ -185,6 +289,10 @@ class DiscreteDiffusion(nn.Module):
 
         # Predict x_0 distribution
         pred_logits = denoiser(x_tp1, t, condition)  # [B, N, V]
+        # Clamp logits to prevent extreme values from amplifying through softmax/CE.
+        # Range [-30, 30] keeps softmax numerically safe (exp(30) ≈ 1e13) while still
+        # allowing the model to express confident predictions.
+        pred_logits = pred_logits.clamp(-30.0, 30.0)
         pred_probs = F.softmax(pred_logits, dim=-1)  # [B, N, V]
 
         # L_k0: auxiliary loss (Eq.19) -log g_theta(k_0 | k_s, y)
@@ -202,11 +310,19 @@ class DiscreteDiffusion(nn.Module):
             pred_pose = prior_model.decode_from_indices(pred_indices)
             l_recon = F.smooth_l1_loss(pred_pose, target_pose)
 
-        # L_vlb: skipped during early training (OOM risk + numerical instability)
-        l_vlb = torch.tensor(0.0, device=device)
+        # L_vlb: enabled with small weight (0.01) to provide the core KL constraint
+        # from paper Eq.16 while limiting its magnitude vs. l_tkn during early training.
+        # The chunked compute path has finite-check safety nets for inf/nan resilience.
+        vlb_weight = 0.01
+        if vlb_weight > 0:
+            l_vlb = self._compute_vlb_chunked(x_0, x_tp1, t, pred_probs, chunk_size=512)
+        else:
+            l_vlb = torch.tensor(0.0, device=device)
 
-        # Total loss (Eq.20, VLB disabled for stability)
-        total_loss = eta * l_k0 + l_tkn + l_recon
+        # Total loss: l_recon excluded from backward path because the argmax+frozen-decoder
+        # path provides zero gradient anyway; including it just adds noisy magnitude that
+        # can swing total_loss without driving learning. Keep it as a monitoring metric.
+        total_loss = eta * l_k0 + l_tkn + vlb_weight * l_vlb
 
         return total_loss, l_recon, l_k0, l_vlb, l_tkn
 

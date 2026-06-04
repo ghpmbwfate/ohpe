@@ -114,8 +114,9 @@ class PoseDenoiser(nn.Module):
         self.num_classes = num_classes
         self.num_states = num_classes + 1  # +1 for Obs token
 
-        # Token embedding
+        # Token embedding (conservative init to prevent early gradient explosion)
         self.token_embed = nn.Embedding(self.num_states, hidden_dim)
+        nn.init.normal_(self.token_embed.weight, mean=0.0, std=0.02)
 
         # Timestep embedding
         self.time_embed = nn.Sequential(
@@ -134,9 +135,11 @@ class PoseDenoiser(nn.Module):
             for _ in range(num_blocks)
         ])
 
-        # Output head
+        # Output head (conservative init: near-zero logits at start)
         self.output_norm = nn.LayerNorm(hidden_dim)
         self.output_proj = nn.Linear(hidden_dim, num_classes)
+        nn.init.normal_(self.output_proj.weight, mean=0.0, std=0.02)
+        nn.init.zeros_(self.output_proj.bias)
 
     def forward(self, x_t, t, condition):
         """

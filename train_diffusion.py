@@ -4,9 +4,11 @@ Training script for Discrete Diffusion Model.
 import os
 import argparse
 import yaml
+import math
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from torch.optim.lr_scheduler import LambdaLR
 from tqdm import tqdm
 
 # Set cache dirs for pretrained models before importing model classes
@@ -20,8 +22,17 @@ from models.multimodal_encoder import MultimodalConditionEncoder
 from utils.data_utils import COCOPoseDataset, PoseDataset, collate_fn
 
 
+def get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps):
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return step / max(1, warmup_steps)
+        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        return max(0.0, 0.5 * (1 + math.cos(math.pi * progress)))
+    return LambdaLR(optimizer, lr_lambda)
+
+
 def train_epoch(prior, denoiser, diffusion, cond_encoder, dataloader,
-                optimizer, device, eta):
+                optimizer, scheduler, device, eta):
     prior.eval()
     denoiser.train()
     cond_encoder.train()
@@ -31,6 +42,12 @@ def train_epoch(prior, denoiser, diffusion, cond_encoder, dataloader,
     total_k0 = 0
     total_vlb = 0
     total_tkn = 0
+    grad_norms = []
+    max_grad_norm_raw = 0.0  # 记录被跳过的极端值，供诊断
+    skipped = 0
+    n_steps = 0
+
+    all_params = list(denoiser.parameters()) + list(cond_encoder.parameters())
 
     for batch in tqdm(dataloader, desc='Train', leave=False):
         images, poses, visibilities, texts = batch
@@ -50,11 +67,44 @@ def train_epoch(prior, denoiser, diffusion, cond_encoder, dataloader,
             denoiser, x_0, t, condition, poses, prior, eta
         )
 
+        # Skip bad batch before any parameter update
+        if torch.isnan(loss) or torch.isinf(loss):
+            skipped += 1
+            continue
+
         optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(denoiser.parameters(), 1.0)
-        torch.nn.utils.clip_grad_norm_(cond_encoder.parameters(), 1.0)
+
+        # Check raw gradients for inf/nan BEFORE clip. clip_grad_norm_ computes
+        # inf/inf = nan and silently corrupts every param, killing training permanently.
+        has_bad_grad = False
+        for p in all_params:
+            if p.grad is not None and not torch.isfinite(p.grad).all():
+                has_bad_grad = True
+                break
+
+        if has_bad_grad:
+            optimizer.zero_grad()
+            skipped += 1
+            continue
+
+        gn_d = torch.nn.utils.clip_grad_norm_(denoiser.parameters(), 0.5)
+        gn_c = torch.nn.utils.clip_grad_norm_(cond_encoder.parameters(), 0.5)
+
+        # Belt-and-suspenders: even with finite raw grads, clip with extreme magnitudes
+        # can still produce a non-finite norm; reject those steps too.
+        if not (torch.isfinite(gn_d) and torch.isfinite(gn_c)):
+            optimizer.zero_grad()
+            skipped += 1
+            continue
+
         optimizer.step()
+        scheduler.step()
+
+        gn = max(float(gn_d), float(gn_c))
+        grad_norms.append(gn)
+        max_grad_norm_raw = max(max_grad_norm_raw, gn)
+        n_steps += 1
 
         total_loss += loss.item()
         total_recon += recon_loss.item()
@@ -62,14 +112,11 @@ def train_epoch(prior, denoiser, diffusion, cond_encoder, dataloader,
         total_vlb += l_vlb.item()
         total_tkn += l_tkn.item()
 
-        # NaN detection
-        if torch.isnan(loss):
-            print(f"NaN detected! loss={loss.item():.4f}, recon={recon_loss.item():.4f}")
-            break
-
-    n = len(dataloader)
+    n = max(1, n_steps)
+    gn_mean = sum(grad_norms) / n if grad_norms else 0.0
     return (total_loss / n, total_recon / n, total_k0 / n,
-            total_vlb / n, total_tkn / n)
+            total_vlb / n, total_tkn / n,
+            max_grad_norm_raw, gn_mean, skipped)
 
 
 @torch.no_grad()
@@ -183,15 +230,19 @@ def main():
     optimizer = torch.optim.AdamW(
         list(denoiser.parameters()) + list(cond_encoder.parameters()),
         lr=cfg['lr'], weight_decay=cfg['weight_decay'],
-        betas=(0.9, 0.96),
+        betas=(0.9, 0.999),
     )
+
+    warmup_steps = cfg.get('warmup_steps', 1000)
+    total_steps = cfg['epochs'] * len(train_loader)
+    scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
 
     best_val = float('inf')
     for epoch in range(cfg['epochs']):
         (train_loss, train_recon, train_k0,
-         train_vlb, train_tkn) = train_epoch(
+         train_vlb, train_tkn, train_gn_max, train_gn_mean, train_skip) = train_epoch(
             prior, denoiser, diffusion, cond_encoder, train_loader,
-            optimizer, device, cfg['eta']
+            optimizer, scheduler, device, cfg['eta']
         )
         (val_loss, val_recon, val_k0,
          val_vlb, val_tkn) = validate(
@@ -199,7 +250,9 @@ def main():
             device, cfg['eta']
         )
 
-        print(f"Epoch {epoch+1}/{cfg['epochs']} | "
+        current_lr = scheduler.get_last_lr()[0]
+        print(f"Epoch {epoch+1}/{cfg['epochs']} | lr={current_lr:.2e} | "
+              f"gn_mean={train_gn_mean:.3f} gn_max={train_gn_max:.3f} skipped={train_skip} | "
               f"train_loss={train_loss:.4f} (recon={train_recon:.4f}, k0={train_k0:.4f}, "
               f"vlb={train_vlb:.4f}, tkn={train_tkn:.4f}) | "
               f"val_loss={val_loss:.4f} (recon={val_recon:.4f}, k0={val_k0:.4f}, "
